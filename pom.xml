@@ -20,6 +20,8 @@
     <description>Event-driven order processing system built as Spring Boot microservices over Kafka</description>
 
     <modules>
+        <module>common-events</module>
+        <module>service-support</module>
     </modules>
 
     <properties>
