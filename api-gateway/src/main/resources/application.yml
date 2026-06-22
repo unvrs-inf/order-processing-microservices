@@ -1,0 +1,94 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6380}
+      # Локальный Redis слушает только 127.0.0.1. При заданном пароле Compose
+      # запускает Redis с --requirepass, а шлюз использует пароль.
+      password: ${REDIS_PASSWORD:}
+      # Короткий тайм-аут ограничивает задержку запроса при недоступном Redis.
+      # Шлюз пропускает запрос после ошибки лимитера.
+      timeout: ${REDIS_TIMEOUT:500ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:500ms}
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # Лимит действует на все маршруты /api/**. UserOrIpKeyResolver использует
+          # идентификатор пользователя или IP клиента. Счётчик отдельный для каждого маршрута и ключа.
+          default-filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: ${RATE_LIMIT_REPLENISH_RATE:10}
+                redis-rate-limiter.burstCapacity: ${RATE_LIMIT_BURST_CAPACITY:20}
+                redis-rate-limiter.requestedTokens: ${RATE_LIMIT_REQUESTED_TOKENS:1}
+          routes:
+            - id: auth-service
+              uri: ${AUTH_SERVICE_URI:http://localhost:8081}
+              predicates:
+                - Path=/api/auth/**
+            - id: order-service
+              uri: ${ORDER_SERVICE_URI:http://localhost:8082}
+              predicates:
+                - Path=/api/orders/**
+            - id: inventory-service
+              uri: ${INVENTORY_SERVICE_URI:http://localhost:8083}
+              predicates:
+                - Path=/api/products/**,/api/inventory/**
+            - id: payment-service
+              uri: ${PAYMENT_SERVICE_URI:http://localhost:8084}
+              predicates:
+                - Path=/api/payments/**
+            - id: notification-service
+              uri: ${NOTIFICATION_SERVICE_URI:http://localhost:8085}
+              predicates:
+                - Path=/api/notifications/**
+
+gateway:
+  security:
+    # Ключи auth-service загружаются по запросу и кешируются.
+    jwks-uri: ${AUTH_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    issuer: ${AUTH_JWT_ISSUER:order-processing-auth}
+  cors:
+    allowed-origins: ${GATEWAY_CORS_ORIGINS:http://localhost:5173}
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      # Переключается экспорт спанов. Идентификаторы и передача контекста работают постоянно.
+      # docker-compose.yml turns it off for the containers unless Jaeger is wanted.
+      export:
+        enabled: ${OTLP_TRACING_EXPORT_ENABLED:true}
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus,gateway}
+  endpoint:
+    gateway:
+      # Таблица маршрутов /actuator/gateway/routes доступна роли ADMIN.
+      access: ${MANAGEMENT_GATEWAY_ENDPOINT_ACCESS:unrestricted}
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+    org.springframework.cloud.gateway: ${LOG_LEVEL_GATEWAY:INFO}
