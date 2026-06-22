@@ -22,6 +22,7 @@
     <modules>
         <module>common-events</module>
         <module>service-support</module>
+        <module>auth-service</module>
     </modules>
 
     <properties>
