@@ -24,6 +24,7 @@
         <module>service-support</module>
         <module>api-gateway</module>
         <module>auth-service</module>
+        <module>order-service</module>
     </modules>
 
     <properties>
