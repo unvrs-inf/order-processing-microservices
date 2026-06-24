@@ -1,0 +1,161 @@
+server:
+  port: ${SERVER_PORT:8082}
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5435}/${ORDER_DB_NAME:order_db}
+    username: ${ORDER_DB_USER:order_user}
+    password: ${ORDER_DB_PASSWORD:order_local_dev_only}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        # Для страниц заказов строки загружаются одним дополнительным запросом.
+        # Загрузка коллекции через JOIN FETCH переносит пагинацию в память.
+        default_batch_fetch_size: 32
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:order-service}
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:earliest}
+      enable-auto-commit: false
+      # Обработчики Saga читают строки. EventEnvelopeReader определяет тип по eventType,
+      # чтобы ошибку формата можно было классифицировать на уровне обработчика.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
+
+# ---------------------------------------------------------------- надёжность (service-support)
+# Подключены outbox, журнал обработанных событий, повторы и DLT. Таблицы создаются
+# по V2__create_orders.sql и V3__saga.sql.
+outbox:
+  enabled: true
+  # Значение поля outbox_events.aggregate_type для событий этого сервиса.
+  aggregate-type: Order
+  # От частоты опроса зависит задержка между созданием заказа и первым шагом Saga.
+  poll-interval-ms: ${OUTBOX_POLL_MS:500}
+  # Строки берутся пачкой через FOR UPDATE SKIP LOCKED. Малый размер пачки
+  # сокращает время блокировки при недоступном брокере.
+  batch-size: ${OUTBOX_BATCH_SIZE:50}
+  # Тайм-аут ожидания отправки больше delivery-timeout-ms. Продюсер завершит
+  # свою попытку до того, как relay перестанет ждать ответ.
+  send-timeout: ${OUTBOX_SEND_TIMEOUT:PT15S}
+  # Срок хранения опубликованных событий для аудита.
+  retention: ${OUTBOX_RETENTION:P7D}
+  cleanup-interval-ms: ${OUTBOX_CLEANUP_MS:3600000}
+  # Отключается в тестах, где relay вызывается вручную.
+  scheduler-enabled: ${OUTBOX_SCHEDULER_ENABLED:true}
+  producer:
+    max-block-ms: ${OUTBOX_PRODUCER_MAX_BLOCK_MS:5000}
+    request-timeout-ms: ${OUTBOX_PRODUCER_REQUEST_TIMEOUT_MS:5000}
+    delivery-timeout-ms: ${OUTBOX_PRODUCER_DELIVERY_TIMEOUT_MS:10000}
+
+idempotency:
+  enabled: true
+  retention: ${PROCESSED_EVENTS_RETENTION:P7D}
+  cleanup-interval-ms: ${PROCESSED_EVENTS_CLEANUP_MS:3600000}
+
+messaging:
+  consumer:
+    enabled: true
+    # Один поток. Порядок по заказу обеспечивается ключом партиции Kafka.
+    concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+    # После четырёх попыток (около 3.5 с) сообщение попадает в <topic>.DLT.
+    retries: ${KAFKA_CONSUMER_RETRIES:3}
+    initial-backoff-ms: ${KAFKA_CONSUMER_BACKOFF_MS:500}
+    backoff-multiplier: ${KAFKA_CONSUMER_BACKOFF_MULTIPLIER:2.0}
+    max-backoff-ms: ${KAFKA_CONSUMER_MAX_BACKOFF_MS:4000}
+
+orders:
+  saga:
+    # Если текущий шаг не ответил за это время, заказ отменяется с компенсацией.
+    # Запас по времени позволяет завершиться медленной Saga.
+    timeout: ${ORDER_SAGA_TIMEOUT:PT2M}
+    sweep-interval-ms: ${ORDER_SAGA_SWEEP_MS:15000}
+    timeout-sweeper-enabled: ${ORDER_SAGA_SWEEPER_ENABLED:true}
+    # Интервал повторной команды RefundPayment отсчитывается от последней попытки.
+    # Платёжный сервис выполняет возврат один раз на заказ. Проверка тайм-аутов Saga
+    # пропускает заказы с незавершённым возвратом. Повторы определяет только этот интервал.
+    refund-retry-interval: ${ORDER_SAGA_REFUND_RETRY_INTERVAL:PT30S}
+    # Число попыток шага при конфликте оптимистической блокировки.
+    max-attempts: ${ORDER_SAGA_MAX_ATTEMPTS:3}
+
+# Снимок цен запрашивается у inventory-service по HTTP с повторами и circuit breaker.
+# Учитываются InventoryCallFailedException при тайм-ауте, обрыве соединения или 5xx.
+# Неизвестный товар (404) не приводит к повтору и не учитывается circuit breaker.
+resilience4j:
+  circuitbreaker:
+    instances:
+      inventory:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: ${INVENTORY_CB_WINDOW:20}
+        minimum-number-of-calls: ${INVENTORY_CB_MINIMUM_CALLS:10}
+        failure-rate-threshold: ${INVENTORY_CB_FAILURE_RATE:50}
+        wait-duration-in-open-state: ${INVENTORY_CB_OPEN_WAIT:10s}
+        permitted-number-of-calls-in-half-open-state: ${INVENTORY_CB_HALF_OPEN_CALLS:3}
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+        record-exceptions:
+          - com.example.orders.order.client.InventoryCallFailedException
+  retry:
+    instances:
+      inventory:
+        max-attempts: ${INVENTORY_RETRY_MAX_ATTEMPTS:3}
+        wait-duration: ${INVENTORY_RETRY_WAIT:200ms}
+        retry-exceptions:
+          - com.example.orders.order.client.InventoryCallFailedException
+
+management:
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      # Переключается экспорт спанов. Идентификаторы и передача контекста работают постоянно.
+      # docker-compose.yml turns it off for the containers unless Jaeger is wanted.
+      export:
+        enabled: ${OTLP_TRACING_EXPORT_ENABLED:true}
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.kafka.listener: true
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS:health,info,prometheus}
+  endpoint:
+    health:
+      show-details: ${MANAGEMENT_HEALTH_SHOW_DETAILS:always}
+      probes:
+        enabled: true
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.example.orders: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    # Шаблон Spring Boot выводит идентификатор корреляции, помещённый service-support в MDC.
+    correlation: "[${spring.application.name:order-service},%X{correlationId:-},%X{traceId:-}] "
