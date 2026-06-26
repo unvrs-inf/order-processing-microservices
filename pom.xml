@@ -26,6 +26,8 @@
         <module>auth-service</module>
         <module>order-service</module>
         <module>inventory-service</module>
+        <module>payment-service</module>
+        <module>notification-service</module>
     </modules>
 
     <properties>
