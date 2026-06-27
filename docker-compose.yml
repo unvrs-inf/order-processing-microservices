@@ -1,0 +1,293 @@
+# Профили Compose:
+#   без профиля    Postgres, Kafka, Redis и MailHog. Сервисы запускаются на хосте.
+#   app            Все шесть сервисов работают в контейнерах.
+#   observability  Jaeger, Prometheus и Grafana. Для отправки спанов из контейнеров
+#                  включи OTLP_TRACING_EXPORT_ENABLED=true вместе с этим профилем.
+#
+# Порты хоста: Postgres 5435, Kafka 9094, Redis 6380, MailHog 1025/8025.
+# По умолчанию опубликованные порты привязаны к 127.0.0.1 через BIND_ADDRESS.
+# Контейнеры обращаются друг к другу по именам сервисов. Перед запуском в сети
+# проверь раздел README «Перед запуском в сети».
+
+name: order-processing
+
+x-app: &app
+  profiles: ["app"]
+  restart: unless-stopped
+  mem_limit: 384m
+
+x-app-env: &app-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  AUTH_JWKS_URI: http://auth-service:8081/.well-known/jwks.json
+  # Jaeger входит в профиль observability. При включённом экспорте без коллектора
+  # в логах появляется ERROR на каждой попытке отправки. Трассировка в логах и Kafka
+  # сохраняется при отключённом экспорте. Пример с экспортом:
+  #   OTLP_TRACING_EXPORT_ENABLED=true docker compose --profile app --profile observability up -d
+  # При изменении переменной Compose пересоздаёт контейнеры сервисов.
+  OTLP_TRACING_EXPORT_ENABLED: ${OTLP_TRACING_EXPORT_ENABLED:-false}
+  OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=65"
+  # Размер пула соединений для каждого сервиса. У сервисов отдельные базы данных.
+  DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-5}
+  KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
+
+services:
+  postgres:
+    # Образ postgres:16 со скриптами из infra/postgres/init.
+    build:
+      context: ./infra/postgres
+    image: order-processing/postgres:16
+    container_name: op-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres_local_dev_only}
+      POSTGRES_DB: postgres
+      # По умолчанию initdb оставляет для TCP loopback метод trust. Оба параметра
+      # действуют на пустом томе. Доступ через локальные Unix-сокеты остаётся.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+      # Пользователи баз сервисов. Скрипт infra/postgres/init/01-create-databases.sh
+      # создаёт их с указанными здесь локальными паролями.
+      AUTH_DB_NAME: ${AUTH_DB_NAME:-auth_db}
+      AUTH_DB_USER: ${AUTH_DB_USER:-auth_user}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-auth_local_dev_only}
+      ORDER_DB_NAME: ${ORDER_DB_NAME:-order_db}
+      ORDER_DB_USER: ${ORDER_DB_USER:-order_user}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local_dev_only}
+      INVENTORY_DB_NAME: ${INVENTORY_DB_NAME:-inventory_db}
+      INVENTORY_DB_USER: ${INVENTORY_DB_USER:-inventory_user}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local_dev_only}
+      PAYMENT_DB_NAME: ${PAYMENT_DB_NAME:-payment_db}
+      PAYMENT_DB_USER: ${PAYMENT_DB_USER:-payment_user}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_local_dev_only}
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notification_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_user}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_local_dev_only}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5435}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  kafka:
+    image: apache/kafka:4.0.2
+    container_name: op-kafka
+    restart: unless-stopped
+    ports:
+      # Внешний listener для сервисов на хосте, включая mvn spring-boot:run.
+      - "${BIND_ADDRESS:-127.0.0.1}:${KAFKA_EXTERNAL_PORT:-9094}:9094"
+    environment:
+      # В одноузловом KRaft контейнер совмещает брокер и контроллер.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      # INTERNAL используется контейнерами, EXTERNAL — клиентами на хосте.
+      # Публикуемый адрес EXTERNAL совпадает с адресом, по которому подключаются клиенты.
+      # Для удалённого брокера задай KAFKA_EXTERNAL_HOST.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_EXTERNAL_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+      # Размер кучи с учётом примерно 4 ГБ памяти Docker Desktop.
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms128m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7
+    container_name: op-redis
+    restart: unless-stopped
+    # Локальный Redis на 127.0.0.1 работает без пароля. Для запуска в сети задай
+    # REDIS_PASSWORD. Сервер будет требовать пароль, и шлюз передаст его.
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass "$$REDIS_PASSWORD"
+        else
+          exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+        fi
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      # При --requirepass команда redis-cli ping без пароля отвечает NOAUTH, но
+      # завершается с кодом 0. Проверка использует пароль, когда он задан,
+      # и проверяет ответ сервера.
+      test: ['CMD-SHELL', 'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  mailhog:
+    image: mailhog/mailhog
+    container_name: op-mailhog
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${MAILHOG_SMTP_PORT:-1025}:1025"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MAILHOG_UI_PORT:-8025}:8025"
+    healthcheck:
+      # Образ не содержит curl или wget. Порт проверяет сам MailHog.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8025 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # ------------------------------------------------------------------ сервисы приложения
+  # Профиль app запускает сервисы в Docker. Без него Compose поднимает инфраструктуру.
+  auth-service:
+    <<: *app
+    build: { context: ., args: { MODULE: auth-service } }
+    image: order-processing/auth-service:local
+    container_name: op-auth
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8081
+      AUTH_DB_NAME: ${AUTH_DB_NAME:-auth_db}
+      AUTH_DB_USER: ${AUTH_DB_USER:-auth_user}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-auth_local_dev_only}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-order-processing-auth}
+      AUTH_JWT_EXPIRATION: ${AUTH_JWT_EXPIRATION:-PT1H}
+      AUTH_JWT_KEY_ID: ${AUTH_JWT_KEY_ID:-}
+      AUTH_JWT_PRIVATE_KEY: ${AUTH_JWT_PRIVATE_KEY:-}
+      AUTH_JWT_PUBLIC_KEY: ${AUTH_JWT_PUBLIC_KEY:-}
+      # Демонстрационный администратор. Поменяй пароль до первого запуска общего стенда.
+      AUTH_ADMIN_EMAIL: ${AUTH_ADMIN_EMAIL:-admin@orders.local}
+      AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD:-Admin@LocalDevOnly}
+      AUTH_ADMIN_NAME: ${AUTH_ADMIN_NAME:-Platform Admin}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8081:8081"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  inventory-service:
+    <<: *app
+    build: { context: ., args: { MODULE: inventory-service } }
+    image: order-processing/inventory-service:local
+    container_name: op-inventory
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8083
+      INVENTORY_DB_NAME: ${INVENTORY_DB_NAME:-inventory_db}
+      INVENTORY_DB_USER: ${INVENTORY_DB_USER:-inventory_user}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local_dev_only}
+      INVENTORY_SEED_DEMO: ${INVENTORY_SEED_DEMO:-true}
+      INVENTORY_RESERVATION_MAX_ATTEMPTS: ${INVENTORY_RESERVATION_MAX_ATTEMPTS:-3}
+      # Сверка предварительно вызывает GET /api/orders/{id} с токеном администратора.
+      ORDER_BASE_URL: http://order-service:8082
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8083:8083"]
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
+
+  order-service:
+    <<: *app
+    build: { context: ., args: { MODULE: order-service } }
+    image: order-processing/order-service:local
+    container_name: op-order
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8082
+      ORDER_DB_NAME: ${ORDER_DB_NAME:-order_db}
+      ORDER_DB_USER: ${ORDER_DB_USER:-order_user}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local_dev_only}
+      INVENTORY_BASE_URL: http://inventory-service:8083
+      ORDER_SAGA_TIMEOUT: ${ORDER_SAGA_TIMEOUT:-PT2M}
+      ORDER_SAGA_REFUND_RETRY_INTERVAL: ${ORDER_SAGA_REFUND_RETRY_INTERVAL:-PT30S}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8082:8082"]
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
+
+  payment-service:
+    <<: *app
+    build: { context: ., args: { MODULE: payment-service } }
+    image: order-processing/payment-service:local
+    container_name: op-payment
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8084
+      PAYMENT_DB_NAME: ${PAYMENT_DB_NAME:-payment_db}
+      PAYMENT_DB_USER: ${PAYMENT_DB_USER:-payment_user}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_local_dev_only}
+      # Платёжный провайдер имитирует операции внутри сервиса.
+      PAYMENT_DECLINE_ABOVE: ${PAYMENT_DECLINE_ABOVE:-1000.00}
+      PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0}
+      PAYMENT_MAX_ATTEMPTS: ${PAYMENT_MAX_ATTEMPTS:-3}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8084:8084"]
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, auth-service: { condition: service_healthy } }
+
+  notification-service:
+    <<: *app
+    build: { context: ., args: { MODULE: notification-service } }
+    image: order-processing/notification-service:local
+    container_name: op-notification
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8085
+      NOTIFICATION_DB_NAME: ${NOTIFICATION_DB_NAME:-notification_db}
+      NOTIFICATION_DB_USER: ${NOTIFICATION_DB_USER:-notification_user}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_local_dev_only}
+      NOTIFICATION_FROM: ${NOTIFICATION_FROM:-orders@orders.local}
+      NOTIFICATION_RECIPIENT_DOMAIN: ${NOTIFICATION_RECIPIENT_DOMAIN:-customers.orders.local}
+      NOTIFICATION_EMAIL_ENABLED: ${NOTIFICATION_EMAIL_ENABLED:-true}
+      MAIL_HOST: mailhog
+      MAIL_PORT: 1025
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8085:8085"]
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy }, mailhog: { condition: service_healthy }, auth-service: { condition: service_healthy } }
+
+  api-gateway:
+    <<: *app
+    build: { context: ., args: { MODULE: api-gateway } }
+    image: order-processing/api-gateway:local
+    container_name: op-gateway
+    environment:
+      <<: *app-env
+      SERVER_PORT: 8080
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_TIMEOUT: ${REDIS_TIMEOUT:-500ms}
+      REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT:-500ms}
+      GATEWAY_CORS_ORIGINS: ${GATEWAY_CORS_ORIGINS:-http://localhost:5173}
+      RATE_LIMIT_REPLENISH_RATE: ${RATE_LIMIT_REPLENISH_RATE:-10}
+      RATE_LIMIT_BURST_CAPACITY: ${RATE_LIMIT_BURST_CAPACITY:-20}
+      RATE_LIMIT_REQUESTED_TOKENS: ${RATE_LIMIT_REQUESTED_TOKENS:-1}
+      MANAGEMENT_GATEWAY_ENDPOINT_ACCESS: ${MANAGEMENT_GATEWAY_ENDPOINT_ACCESS:-unrestricted}
+      # Издатель JWT должен совпадать с настройкой auth-service.
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:-order-processing-auth}
+      AUTH_SERVICE_URI: http://auth-service:8081
+      ORDER_SERVICE_URI: http://order-service:8082
+      INVENTORY_SERVICE_URI: http://inventory-service:8083
+      PAYMENT_SERVICE_URI: http://payment-service:8084
+      NOTIFICATION_SERVICE_URI: http://notification-service:8085
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:8080:8080"]
+    depends_on: { redis: { condition: service_healthy }, auth-service: { condition: service_healthy } }
+
+volumes:
+  postgres-data:
+  kafka-data:
+  redis-data:
