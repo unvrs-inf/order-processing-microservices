@@ -1,0 +1,50 @@
+# Дополнение фиксирует параметры памяти контейнеров для воспроизводимого запуска.
+# Значения получены через printenv. Секреты остаются в локальном .env.
+#
+# Основной Compose задаёт JAVA_TOOL_OPTIONS с -XX:MaxRAMPercentage=65 и Kafka Xms
+# 128m. Это дополнение сохраняет другие параметры стенда при пересоздании.
+# Блок auth-service совпадает с auth-jwt-preserve-memory.yml.
+#
+# Kafka сохраняет исходный Xms 256m. Для эксперимента с Xms 128m есть отдельный файл.
+
+services:
+  auth-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  inventory-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  order-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  payment-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  notification-service:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  api-gateway:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:+UseG1GC -XX:MaxRAMPercentage=50 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:ReservedCodeCacheSize=64m -XX:ActiveProcessorCount=2 -XX:TieredStopAtLevel=1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 384m
+
+  kafka:
+    # Сохраняем исходную кучу Kafka. В основном Compose указано Xms 128m.
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
