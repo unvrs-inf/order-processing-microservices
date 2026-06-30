@@ -286,3 +286,77 @@ curl -s localhost:8080/api/notifications/me -H "Authorization: Bearer $TOKEN" | 
 | `GET /api/orders` | Администратор |
 | `GET /api/payments/order/{orderId}` | Владелец или администратор |
 | `GET /api/notifications/me` | Пользователь |
+
+## Конфигурация
+
+В [`.env.example`](.env.example) перечислены параметры и локальные значения по умолчанию. Основные переменные:
+
+| Параметр | Назначение |
+|---|---|
+| `AUTH_JWT_PRIVATE_KEY`, `AUTH_JWT_PUBLIC_KEY` | Постоянная пара ключей. Если оба поля пустые, сервис генерирует пару при запуске |
+| `PAYMENT_DECLINE_ABOVE` | Порог отклонения платежа, по умолчанию 1000.00 |
+| `ORDER_SAGA_TIMEOUT` | Тайм-аут обработки заказа, по умолчанию 2 минуты |
+| `ORDER_SAGA_REFUND_RETRY_INTERVAL` | Интервал повторного запроса возврата, по умолчанию 30 секунд |
+| `RATE_LIMIT_REPLENISH_RATE`, `RATE_LIMIT_BURST_CAPACITY` | Скорость пополнения и ёмкость лимита запросов |
+| `INVENTORY_SEED_DEMO` | Загрузка демонстрационного каталога |
+| `NOTIFICATION_RECIPIENT_DOMAIN` | Домен демонстрационных почтовых адресов |
+
+**Обновление схемы.** Flyway применяет изменения при запуске. Миграции заказа `V5__refund_tracking.sql`, `V6__refund_recovery.sql` и складская `V5__order_release_intents.sql` добавляют поля, ограничение, индексы и таблицу. Существующие заказы получают статус возврата `NONE`. Для уже запрошенных возвратов `refund_retry_at` заполняется значением `updated_at`.
+
+### Восстановление зависших резервов
+
+На стендах до `V5__order_release_intents.sql` у отменённого заказа мог остаться резерв, если команда освобождения обработалась раньше самого резервирования.
+
+```sql
+-- 1) Необязательно: найти идентификаторы кандидатов в базе order-service.
+--    Результат запроса сам по себе не разрешает освобождение.
+SELECT id, status, updated_at FROM orders WHERE status IN ('CANCELLED', 'REJECTED') ORDER BY updated_at DESC;
+-- Проблемные резервы всё ещё находятся в статусе RESERVED в inventory_db.stock_reservations.
+```
+
+```bash
+# 2) Передать inventory-service явный список из не более чем 200 идентификаторов без null.
+#    Ответ содержит по одному результату для каждого уникального заказа.
+curl -X POST http://localhost:8080/api/inventory/reservations/reconcile \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"orderIds":["<id1>","<id2>"],"reason":"incident 1234 cleanup"}'
+# Статус заказа подтверждён (CANCELLED/REJECTED): RELEASED | ALREADY_RELEASED | NO_RESERVATIONS | SKIPPED_COMMITTED
+# Без изменений: REFUSED_ACTIVE_ORDER | REFUSED_ORDER_NOT_FOUND | REFUSED_ACCESS_DENIED |
+#                           REFUSED_UNVERIFIABLE | REFUSED_VERIFICATION_UNAVAILABLE |
+#                           SKIPPED_VERIFICATION_UNAVAILABLE
+```
+
+Для каждого идентификатора inventory-service вызывает `GET /api/orders/{id}` по `ORDER_BASE_URL` (`http://localhost:8082` на хосте, `http://order-service:8082` в Compose). Клиент передаёт исходный токен администратора без записи в логи. Освобождение допускается только после корректного ответа `200` с тем же идентификатором и статусом `CANCELLED` или `REJECTED`.
+
+Другие статусы, ошибки доступа, `404`, тайм-ауты, `5xx`, редиректы, некорректное или слишком большое тело ответа, а также ответ по другому заказу оставляют остатки, резервы, outbox и записи об освобождении без изменений. Тайм-ауты подключения и чтения составляют 1 и 2 секунды (`ORDER_CONNECT_TIMEOUT_MS` и `ORDER_READ_TIMEOUT_MS`). После трёх последовательных сбоев оставшиеся идентификаторы получают `SKIPPED_VERIFICATION_UNAVAILABLE`. После восстановления зависимости запрос можно повторить.
+
+Сверка освобождает строки `RESERVED` и сохраняет признак освобождения, чтобы повторный `OrderCreated` не создал резерв снова. Заказы со строками `COMMITTED` обрабатываются через обычный возврат платежа и `ReleaseStock` после `PaymentRefunded`. Сетевой вызов выполняется до складской транзакции. Транзакционная advisory-блокировка упорядочивает сверку и обычные операции по заказу.
+
+## Перед запуском в сети
+
+Значения с суффиксом `*_local_dev_only` предназначены для локального стенда.
+
+1. Порты по умолчанию привязаны к `127.0.0.1`. Для доступа извне явно задай `BIND_ADDRESS`, например `BIND_ADDRESS=0.0.0.0`. Оставь базы, Kafka, Redis и MailHog в закрытой сети.
+2. Замени пароли в `.env`, включая `POSTGRES_SUPERUSER_PASSWORD`, пять `*_DB_PASSWORD`, `REDIS_PASSWORD`, `GRAFANA_ADMIN_PASSWORD` и `AUTH_ADMIN_PASSWORD`. Скрипт `infra/postgres/init/01-create-databases.sh` создаёт пользователей при первом запуске на пустом томе. Для существующей базы поменяй пароли через `ALTER ROLE`. Пересоздание тома удалит сохранённые данные.
+3. Задай `AUTH_JWT_PRIVATE_KEY` и `AUTH_JWT_PUBLIC_KEY`. Без них сервис генерирует 2048-битную пару при каждом запуске, и ранее выданные токены перестают работать.
+4. Укажи адрес брокера для клиентов через `KAFKA_EXTERNAL_HOST`. Включай `OTLP_TRACING_EXPORT_ENABLED=true` вместе с профилем `observability`.
+5. Postgres проверяет пароль пользователя через `scram-sha-256`. Kafka в этом стенде запускается без SASL/TLS. Redis требует пароль только при заданном `REDIS_PASSWORD`. MailHog принимает сообщения без аутентификации.
+
+## Тесты
+
+Интеграционные тесты используют PostgreSQL и Kafka через Testcontainers, поэтому для них нужен Docker. Тесты проверяют переходы и компенсации Saga, атомарность outbox и повторные попытки публикации, идемпотентность, DLT, конкурентные операции склада, безопасность шлюза, ограничение частоты запросов, CORS и circuit breaker.
+
+- `OrderSagaLatePaymentTest` проверяет единственный возврат после позднего `PaymentCompleted`, обработку дубликатов, повтор потерянной команды и гонку между отменой и оплатой.
+- `InventorySagaReleaseIntentTest`, `OrderSagaLateInventoryTest` и `InventoryReservationReconciliationTest` проверяют освобождение до резервирования, повторные команды, поздний `StockReserved` и отказ от ручной сверки подтверждённых продаж.
+- `StockReservationPrimitiveGuardsTest` воспроизводит конкурентные вызовы складского сервиса на PostgreSQL. `ReservationReconciliationVerificationTest` и `OrderStatusClientTest` проверяют отказы при активном, неизвестном или недоступном заказе, тайм-ауте и некорректном ответе.
+
+```bash
+./mvnw verify
+```
+
+## Ограничения
+
+- Платёжный сервис использует детерминированный имитатор. Он отклоняет суммы выше `PAYMENT_DECLINE_ABOVE` и может отклонять заданную долю заказов. Реальная интеграция потребовала бы вебхуков провайдера, хранения ключей и учёта требований PCI.
+- Письма отправляются на синтетический адрес `<customerId>@NOTIFICATION_RECIPIENT_DOMAIN` (`customers.orders.local` по умолчанию). Для отправки клиентам потребовался бы источник проверенных адресов.
+- SMTP-доставка допускает повторную отправку. Если процесс упадёт после отправки письма, но до фиксации записи об обработке, Kafka доставит событие снова. Ошибка SMTP откатывает обработку события и запускает повторные попытки.
+- Без заданной пары ключей RSA токены перестают действовать после перезапуска auth-service.
