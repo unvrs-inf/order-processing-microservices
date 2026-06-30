@@ -1,0 +1,12 @@
+target/
+**/target/
+.git/
+.idea/
+.vscode/
+.env
+*.log
+secrets/
+*.pem
+*.key
+.DS_Store
+e2e-logs/
